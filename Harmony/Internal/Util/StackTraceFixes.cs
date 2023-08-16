@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
+using System.Reflection.Emit;
 using HarmonyLib.Tools;
 using MonoMod.Core.Platforms;
 using MonoMod.RuntimeDetour;
@@ -61,7 +62,8 @@ namespace HarmonyLib.Internal.RuntimeFixes
 		private static Assembly GetAssemblyFix(GetAssemblyDelegate orig)
 		{
 			var entry = getAssemblyHookManaged?.DetourInfo.Entry ?? getAssemblyHookNative.DetourInfo.Entry;
-			var method = new StackTrace().GetFrames()!.Select(f => f.GetMethod()).SkipWhile(method => method != entry).Skip(1).First();
+			var methodStacks = new StackTrace().GetFrames()!.Select(f => f.GetMethod()).SkipWhile(m => m != entry);
+			var method = methodStacks.Skip(1).First(r => r.GetType().FullName != "System.Reflection.Emit.DynamicMethod+RTDynamicMethod");
 			return method.Module.Assembly;
 		}
 
