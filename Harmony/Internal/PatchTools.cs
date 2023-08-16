@@ -65,13 +65,13 @@ namespace HarmonyLib
 
 					case MethodType.Getter:
 						if (attr.methodName is null)
-							return null;
-						return AccessTools.DeclaredProperty(attr.GetDeclaringType(), attr.methodName).GetGetMethod(true);
+							return AccessTools.DeclaredIndexer(attr.declaringType, attr.argumentTypes).GetGetMethod(true);
+						return AccessTools.DeclaredProperty(attr.declaringType, attr.methodName).GetGetMethod(true);
 
 					case MethodType.Setter:
 						if (attr.methodName is null)
-							return null;
-						return AccessTools.DeclaredProperty(attr.GetDeclaringType(), attr.methodName).GetSetMethod(true);
+							return AccessTools.DeclaredIndexer(attr.declaringType, attr.argumentTypes).GetSetMethod(true);
+						return AccessTools.DeclaredProperty(attr.declaringType, attr.methodName).GetSetMethod(true);
 
 					case MethodType.Constructor:
 						return AccessTools.DeclaredConstructor(attr.GetDeclaringType(), attr.argumentTypes);
@@ -86,6 +86,11 @@ namespace HarmonyLib
 							return null;
 						return AccessTools.EnumeratorMoveNext(AccessTools.DeclaredMethod(attr.GetDeclaringType(),
 							attr.methodName, attr.argumentTypes));
+
+					case MethodType.Async:
+						if (attr.methodName is null)
+							return null;
+						return AccessTools.AsyncMoveNext(AccessTools.DeclaredMethod(attr.GetDeclaringType(), attr.methodName, attr.argumentTypes));
 				}
 			}
 			catch (AmbiguousMatchException ex)

@@ -1,46 +1,30 @@
-using System;
-using System.Collections.Generic;
-using System.Reflection;
-using System.Reflection.Emit;
 using HarmonyLib.Tools;
-using MonoMod.RuntimeDetour;
+using MonoMod.Cil;
+using MonoMod.Core.Platforms;
 using MonoMod.Utils;
+using System;
+using System.Reflection;
+using System.Runtime.InteropServices;
 
 namespace HarmonyLib.Public.Patching
 {
-	/// <summary>
-	///    A method patcher that uses <see cref="MonoMod.RuntimeDetour.NativeDetour" /> to patch internal calls,
-	///    methods marked with <see cref="DynDllImportAttribute" /> and any other managed method that CLR managed-to-native
-	///    trampolines for and which has no IL body defined.
-	/// </summary>
+	/// <inheritdoc/>
 	public class NativeDetourMethodPatcher : MethodPatcher
 	{
-		private static readonly Dictionary<int, Delegate> TrampolineCache = new Dictionary<int, Delegate>();
-		private static int counter;
-		private static readonly object CounterLock = new object();
+		private PlatformTriple.NativeDetour? _hook;
+		private Delegate _replacementDelegate;
 
-		private static readonly MethodInfo GetTrampolineMethod =
-			AccessTools.Method(typeof(NativeDetourMethodPatcher), nameof(GetTrampoline));
-
-		private string[] argTypeNames;
-		private Type[] argTypes;
-
-		private int currentOriginal = -1, newOriginal;
-		private MethodInfo invokeTrampolineMethod;
-		private NativeDetour nativeDetour;
-		private Type returnType;
-		private Type trampolineDelegateType;
+		private readonly Type _returnType;
+		private readonly Type[] _parameterTypes;
+		private readonly Type _altEntryDelegateType;
+		private readonly DataScope<DynamicReferenceCell> _altEntryDelegateStore;
+		private readonly MethodInfo _altEntryDelegateInvoke;
 
 		/// <summary>
-		/// Constructs a new instance of <see cref="NativeDetour"/> method patcher.
+		/// Constructs a new instance of <see cref="PlatformTriple.NativeDetour"/> method patcher.
 		/// </summary>
 		/// <param name="original"></param>
 		public NativeDetourMethodPatcher(MethodBase original) : base(original)
-		{
-			Init();
-		}
-
-		private void Init()
 		{
 			if (AccessTools.IsNetCoreRuntime)
 				Logger.Log(Logger.LogChannel.Warn, () =>
@@ -48,28 +32,28 @@ namespace HarmonyLib.Public.Patching
 					"Extern methods may not be patched because of inlining behaviour of coreclr (refer to https://github.com/dotnet/coreclr/pull/8263)." +
 					"If you need to patch externs, consider using pure NativeDetour instead.");
 
-			var orig = Original;
+			var originalParameters = Original.GetParameters();
 
-			var args = orig.GetParameters();
-			var offs = orig.IsStatic ? 0 : 1;
-			argTypes = new Type[args.Length + offs];
-			argTypeNames = new string[args.Length + offs];
-			returnType = (orig as MethodInfo)?.ReturnType;
+			var offset = Original.IsStatic ? 0 : 1;
 
-			if (!orig.IsStatic)
+			_parameterTypes = new Type[originalParameters.Length + offset];
+
+			if (!Original.IsStatic)
 			{
-				argTypes[0] = orig.GetThisParamType();
-				argTypeNames[0] = "this";
+				_parameterTypes[0] = Original.GetThisParamType();
 			}
 
-			for (var i = 0; i < args.Length; i++)
+			for (int i = 0; i < originalParameters.Length; i++)
 			{
-				argTypes[i + offs] = args[i].ParameterType;
-				argTypeNames[i + offs] = args[i].Name;
+				_parameterTypes[i + offset] = originalParameters[i].ParameterType;
 			}
 
-			trampolineDelegateType = DelegateTypeFactory.instance.CreateDelegateType(returnType, argTypes);
-			invokeTrampolineMethod = AccessTools.Method(trampolineDelegateType, "Invoke");
+			_returnType = Original is MethodInfo { ReturnType: var ret } ? ret : typeof(void);
+
+			_altEntryDelegateType = DelegateTypeFactory.instance.CreateDelegateType(_returnType, _parameterTypes);
+			_altEntryDelegateInvoke = _altEntryDelegateType.GetMethod("Invoke");
+
+			_altEntryDelegateStore = DynamicReferenceManager.AllocReference(default(Delegate), out _);
 		}
 
 		/// <inheritdoc />
@@ -81,50 +65,24 @@ namespace HarmonyLib.Public.Patching
 		/// <inheritdoc />
 		public override MethodBase DetourTo(MethodBase replacement)
 		{
-			nativeDetour?.Dispose();
-
-			nativeDetour = new NativeDetour(Original, replacement, new NativeDetourConfig {ManualApply = true});
-
-			lock (TrampolineCache)
+			_replacementDelegate = replacement.CreateDelegate(_altEntryDelegateType);
+			var replacementDelegatePtr = Marshal.GetFunctionPointerForDelegate(_replacementDelegate);
+			if (_hook is { } hook)
 			{
-				if (currentOriginal >= 0)
-					TrampolineCache.Remove(currentOriginal);
-				currentOriginal = newOriginal;
-				TrampolineCache[currentOriginal] = CreateDelegate(trampolineDelegateType,
-					nativeDetour.GenerateTrampoline(invokeTrampolineMethod));
+				hook.Simple.ChangeTarget(replacementDelegatePtr);
 			}
-
-			nativeDetour.Apply();
+			else
+			{
+				_hook = PlatformTriple.Current.CreateNativeDetour(PlatformTriple.Current.GetNativeMethodBody(Original), replacementDelegatePtr);
+				DynamicReferenceManager.SetValue(_altEntryDelegateStore.Data, Marshal.GetDelegateForFunctionPointer(_hook.Value.AltEntry, _altEntryDelegateType));
+			}
 			return replacement;
 		}
 
 		/// <inheritdoc />
 		public override DynamicMethodDefinition CopyOriginal()
 		{
-			if (!(Original is MethodInfo mi))
-				return null;
-			var dmd = new DynamicMethodDefinition("OrigWrapper", returnType, argTypes);
-			var il = dmd.GetILGenerator();
-			for (var i = 0; i < argTypes.Length; i++)
-				il.Emit(OpCodes.Ldarg, i);
-			il.Emit(OpCodes.Call, mi);
-			il.Emit(OpCodes.Ret);
-			return dmd;
-		}
-
-		private Delegate CreateDelegate(Type delegateType, MethodBase mb)
-		{
-			if (mb is DynamicMethod dm)
-				return dm.CreateDelegate(delegateType);
-
-			return Delegate.CreateDelegate(delegateType,
-				mb as MethodInfo ?? throw new InvalidCastException($"Unexpected method type: {mb.GetType()}"));
-		}
-
-		private static Delegate GetTrampoline(int hash)
-		{
-			lock (TrampolineCache)
-				return TrampolineCache[hash];
+			return null;
 		}
 
 		private DynamicMethodDefinition GenerateManagedOriginal()
@@ -133,28 +91,23 @@ namespace HarmonyLib.Public.Patching
 			// It simply calls the trampoline generated by MonoMod
 			// As a result, we can pass the managed original to HarmonyManipulator like a normal method
 
-			var orig = Original;
+			var dmd = new DynamicMethodDefinition(
+				$"NativeHookProxy<{Original.DeclaringType.FullName}:{Original.Name}>",
+				_returnType,
+				_parameterTypes
+			);
 
-			lock (CounterLock)
+			var il = new ILContext(dmd.Definition);
+
+			var c = new ILCursor(il);
+
+			c.EmitLoadReference(_altEntryDelegateStore.Data);
+			for (int i = 0; i < _parameterTypes.Length; i++)
 			{
-				newOriginal = counter;
-				counter++;
+				c.EmitLdarg(i);
 			}
-
-			var dmd = new DynamicMethodDefinition($"NativeDetour_Wrapper<{orig.GetID(simple: true)}>?{newOriginal}", returnType, argTypes);
-
-			var def = dmd.Definition;
-			for (var i = 0; i < argTypeNames.Length; i++)
-				def.Parameters[i].Name = argTypeNames[i];
-
-			var il = dmd.GetILGenerator();
-
-			il.Emit(OpCodes.Ldc_I4, newOriginal);
-			il.Emit(OpCodes.Call, GetTrampolineMethod);
-			for (var i = 0; i < argTypes.Length; i++)
-				il.Emit(OpCodes.Ldarg, i);
-			il.Emit(OpCodes.Call, invokeTrampolineMethod);
-			il.Emit(OpCodes.Ret);
+			c.EmitCallvirt(_altEntryDelegateInvoke);
+			c.EmitRet();
 
 			return dmd;
 		}
@@ -162,12 +115,12 @@ namespace HarmonyLib.Public.Patching
 		/// <summary>
 		/// A handler for <see cref="PatchManager.ResolvePatcher"/> that checks if a method doesn't have a body
 		/// (e.g. it's icall or marked with <see cref="DynDllImportAttribute"/>) and thus can be patched with
-		/// <see cref="NativeDetour"/>.
+		/// <see cref="PlatformTriple.NativeDetour"/>.
 		/// </summary>
 		/// <param name="sender">Not used</param>
 		/// <param name="args">Patch resolver arguments</param>
 		///
-		public static void TryResolve(object sender, PatchManager.PatcherResolverEventArgs args)
+		public static void TryResolve(object _, PatchManager.PatcherResolverEventArgs args)
 		{
 			if (args.Original.GetMethodBody() == null)
 				args.MethodPatcher = new NativeDetourMethodPatcher(args.Original);
