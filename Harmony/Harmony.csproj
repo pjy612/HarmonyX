@@ -25,6 +25,7 @@
         <LangVersion>latest</LangVersion>
         <DefaultItemExcludes>$(DefaultItemExcludes);Documentation/**</DefaultItemExcludes>
         <RootNamespace>HarmonyLib</RootNamespace>
+        <PackageOutputPath>bin</PackageOutputPath>
     </PropertyGroup>
 
     <Choose>
@@ -35,6 +36,7 @@
         <When Condition="$(TargetFramework.Contains('.'))">
             <PropertyGroup>
                 <IsCoreOrStandard>true</IsCoreOrStandard>
+                <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
             </PropertyGroup>
         </When>
         <Otherwise>
@@ -70,7 +72,7 @@
 
     <ItemGroup>
         <!-- Reference assemblies are needed for non-Windows .NET Framework targeting builds. -->
-        <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.2" PrivateAssets="all" />
+        <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="All" />
 
         <!-- Reference MonoMod.RuntimeDetour for our detour needs -->
         <PackageReference Include="MonoMod.RuntimeDetour" Version="25.0.0" />
