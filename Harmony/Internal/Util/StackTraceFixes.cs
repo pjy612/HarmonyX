@@ -63,7 +63,10 @@ namespace HarmonyLib.Internal.RuntimeFixes
 		{
 			var entry = getAssemblyHookManaged?.DetourInfo.Entry ?? getAssemblyHookNative.DetourInfo.Entry;
 			var methodStacks = new StackTrace().GetFrames()!.Select(f => f.GetMethod()).SkipWhile(m => m != entry);
-			var method = methodStacks.Skip(1).First(r => r.GetType().FullName != "System.Reflection.Emit.DynamicMethod+RTDynamicMethod");
+			var method = methodStacks.Skip(1).First(r =>
+				//!r.GetType().FullName.StartsWith("System.Reflection.Emit.DynamicMethod") &&
+				!r.Module.Assembly.FullName.StartsWith("MonoMod.Utils")
+				);
 			return method.Module.Assembly;
 		}
 
