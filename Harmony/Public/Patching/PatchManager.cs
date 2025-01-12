@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
-using MonoMod.Core.Platforms;
+using System.Runtime.CompilerServices;
 
 namespace HarmonyLib.Public.Patching
 {
@@ -14,16 +14,20 @@ namespace HarmonyLib.Public.Patching
 	///
 	public static class PatchManager
 	{
-		private static readonly Dictionary<MethodBase, PatchInfo> PatchInfos = new Dictionary<MethodBase, PatchInfo>();
-		private static readonly Dictionary<MethodBase, MethodPatcher> MethodPatchers = new Dictionary<MethodBase, MethodPatcher>();
-		// Keep replacements as weak references to allow GC to collect them (e.g. if replacement is DynamicMethod)
-		private static readonly List<KeyValuePair<WeakReference, MethodBase>> ReplacementToOriginals = new List<KeyValuePair<WeakReference, MethodBase>>();
+		private static readonly Dictionary<MethodBase, PatchInfo> PatchInfos = new();
+		private static readonly Dictionary<MethodBase, MethodPatcher> MethodPatchers = new();
 
-		// typeof(StackFrame).methodAddress
-		private static FieldInfo methodAddress;
+		private static readonly ConditionalWeakTable<MethodBase, MethodBase> ReplacementToOriginals = new();
+		private static readonly Dictionary<long, MethodBase[]> ReplacementToOriginalsMono = new();
+
+		private static readonly AccessTools.FieldRef<StackFrame, long> MethodAddressRef;
 
 		static PatchManager()
 		{
+			// this field is used to find methods from stackframes in Mono
+			if (AccessTools.IsMonoRuntime && AccessTools.Field(typeof(StackFrame), "methodAddress") is FieldInfo field)
+				MethodAddressRef = AccessTools.FieldRefAccess<StackFrame, long>(field);
+
 			ResolvePatcher += ManagedMethodPatcher.TryResolve;
 			ResolvePatcher += NativeDetourMethodPatcher.TryResolve;
 		}
@@ -98,60 +102,66 @@ namespace HarmonyLib.Public.Patching
 		public static IEnumerable<MethodBase> GetPatchedMethods()
 		{
 			lock (PatchInfos)
-				return PatchInfos.Keys.ToList();
+				return PatchInfos.Keys.ToArray();
 		}
 
-		internal static MethodBase GetOriginal(MethodInfo replacement)
+		// With mono, useReplacement is used to either return the original or the replacement
+		// On .NET, useReplacement is ignored and the original is always returned
+		internal static MethodBase GetRealMethod(MethodInfo method, bool useReplacement)
 		{
+			var identifiableMethod = method.Identifiable();
 			lock (ReplacementToOriginals)
+				if (ReplacementToOriginals.TryGetValue(identifiableMethod, out var original))
+					return original;
+
+			if (AccessTools.IsMonoRuntime)
 			{
-				ReplacementToOriginals.RemoveAll(kv => !kv.Key.IsAlive);
-				foreach (var replacementToOriginal in ReplacementToOriginals)
-				{
-					var method = replacementToOriginal.Key.Target as MethodInfo;
-					if (method == replacement)
-						return replacementToOriginal.Value;
-				}
-				return null;
+				var methodAddress = (long)method.MethodHandle.GetFunctionPointer();
+				lock (ReplacementToOriginalsMono)
+					if (ReplacementToOriginalsMono.TryGetValue(methodAddress, out var info))
+						return useReplacement ? info[1] : info[0];
 			}
+
+			return method;
 		}
 
-		internal static MethodBase FindReplacement(StackFrame frame)
+		internal static MethodBase GetStackFrameMethod(StackFrame frame, bool useReplacement)
 		{
-			methodAddress ??= typeof(StackFrame).GetField("methodAddress", BindingFlags.Instance | BindingFlags.NonPublic);
+			if (frame.GetMethod() is MethodInfo method)
+				return GetRealMethod(method, useReplacement);
 
-			var frameMethod = frame.GetMethod();
-			var methodStart = 0L;
-
-			if (frameMethod is null)
+			if (MethodAddressRef != null)
 			{
-				if (methodAddress == null)
-					return null;
-
-				methodStart = (long) methodAddress.GetValue(frame);
-			}
-			else
-			{
-				var baseMethod = PlatformTriple.Current.GetIdentifiable(frameMethod);
-				methodStart = PlatformTriple.Current.GetNativeMethodBody(baseMethod).ToInt64();
+				var methodAddress = MethodAddressRef(frame);
+				lock (ReplacementToOriginalsMono)
+					if (ReplacementToOriginalsMono.TryGetValue(methodAddress, out var info))
+						return useReplacement ? info[1] : info[0];
 			}
 
-			// Failed to find any usable method, if `frameMethod` is null, we can not find any
-			// method from the stacktrace.
-			if (methodStart == 0)
-				return frameMethod;
-
-			lock (ReplacementToOriginals)
-				return ReplacementToOriginals
-					.FirstOrDefault(kv => kv.Key.IsAlive && PlatformTriple.Current.GetNativeMethodBody((MethodBase)kv.Key.Target).ToInt64() == methodStart).Key.Target as MethodBase;
+			return null;
 		}
 
-		internal static void AddReplacementOriginal(MethodBase original, MethodInfo replacement)
+		internal static void AddReplacementOriginal(MethodBase original, MethodBase replacement)
 		{
+			replacement = (replacement as MethodInfo)?.Identifiable() ?? replacement;
 			if (replacement == null)
 				return;
+
 			lock (ReplacementToOriginals)
-				ReplacementToOriginals.Add(new KeyValuePair<WeakReference, MethodBase>(new WeakReference(replacement), original));
+			{
+				if(!ReplacementToOriginals.TryAdd(replacement, original))
+				{
+					ReplacementToOriginals.Remove(replacement);
+					ReplacementToOriginals.Add(replacement, original);
+				}
+			}
+
+			if (AccessTools.IsMonoRuntime)
+			{
+				var methodAddress = (long)replacement.MethodHandle.GetFunctionPointer();
+				lock (ReplacementToOriginalsMono)
+					ReplacementToOriginalsMono[methodAddress] = [original, replacement];
+			}
 		}
 
 		/// <summary>
